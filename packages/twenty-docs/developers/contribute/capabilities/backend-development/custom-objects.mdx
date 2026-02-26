@@ -1,5 +1,6 @@
 ---
 title: Custom Objects
+info: High-level architecture, specifications, and detailed function requirements for managing custom objects and fields
 ---
 
 
@@ -10,7 +11,7 @@ Standard objects are in-built objects with a set of attributes available for all
 Custom objects are objects that you can create to store information that is unique to your organization. They are not built-in; members of your workspace can create and customize custom objects to hold information that standard objects aren't suitable for.
 
 
-## High-level schema
+## High-level architecture
 
 <div style={{textAlign: 'center'}}>
     <img src="/images/docs/server/custom-object-schema.png" alt="High level schema" />
@@ -18,7 +19,28 @@ Custom objects are objects that you can create to store information that is uniq
 
 <br/>
 
-## How it works
+### Architecture overview
+
+Twenty manages custom objects and fields through a **metadata-driven architecture** with four main layers:
+
+1. **API Layer** — GraphQL resolvers expose mutations and queries for metadata CRUD operations (`/metadata` endpoint for schema management, `/graphql` endpoint for data operations).
+2. **Service Layer** — `ObjectMetadataService` and `FieldMetadataService` orchestrate validation, transformation, and persistence of metadata changes.
+3. **Migration Layer** — `WorkspaceMigrationValidateBuildAndRunService` converts metadata changes into database migrations that are validated, built, and executed against each workspace's schema.
+4. **Cache Layer** — A two-tier caching system (in-memory + backend storage) maintains workspace-specific GraphQL schemas and flat entity maps for fast metadata access.
+
+### Key modules and file locations
+
+| Module | Path | Responsibility |
+|--------|------|----------------|
+| Object Metadata | `packages/twenty-server/src/engine/metadata-modules/object-metadata/` | Custom object CRUD, default field generation |
+| Field Metadata | `packages/twenty-server/src/engine/metadata-modules/field-metadata/` | Field CRUD, type validation, option management |
+| Workspace Migration | `packages/twenty-server/src/engine/workspace-manager/workspace-migration/` | Migration building, validation, and execution |
+| Workspace Cache | `packages/twenty-server/src/engine/workspace-cache/` | Schema and metadata caching with TTL and eviction |
+| Workspace Schema Manager | `packages/twenty-server/src/engine/twenty-orm/workspace-schema-manager/` | Table, column, index, enum, and foreign key management |
+| Frontend Object Metadata | `packages/twenty-front/src/modules/object-metadata/` | GraphQL hooks and state for metadata operations |
+| Frontend Settings UI | `packages/twenty-front/src/modules/settings/data-model/` | Data model settings components |
+
+### How it works
 
 Custom objects come from metadata tables that determine the shape, name, and type of the objects. All this information is present in the metadata schema database, consisting of tables:
 
@@ -37,5 +59,345 @@ To fetch data, the process involves making queries through the /graphql endpoint
 <div style={{textAlign: 'center'}}>
     <img src="/images/docs/server/custom-object-schema.png" alt="Query the /graphql endpoint to fetch data" />
 </div>
+
+### Request flow
+
+When a user creates a custom object or field, the system follows this flow:
+
+```
+Client (Frontend/API)
+  │
+  ▼
+GraphQL Resolver (ObjectMetadataResolver / FieldMetadataResolver)
+  │  — Guards: SettingsPermissionGuard(DATA_MODEL)
+  │
+  ▼
+Service (ObjectMetadataService / FieldMetadataService)
+  │  — Input validation and transformation
+  │  — Default field/relation generation (for new objects)
+  │
+  ▼
+WorkspaceMigrationValidateBuildAndRunService
+  │  — Validate: check flat entity maps for conflicts
+  │  — Build: convert metadata mutations to migration actions
+  │  — Run: execute migrations on the workspace database
+  │
+  ▼
+Cache Invalidation
+  │  — Invalidate metadata GraphQL schema version
+  │  — Flush view-related GraphQL cache
+  │  — Recompute role/permission maps
+  │
+  ▼
+Updated Schema Available
+```
+
+---
+
+## Technical specifications
+
+### Object metadata entity
+
+The `ObjectMetadataEntity` (defined in `object-metadata/object-metadata.entity.ts`) is the core entity representing both standard and custom objects.
+
+**Key properties:**
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `id` | UUID | Primary identifier |
+| `nameSingular` | string | API-friendly singular name (e.g., `company`) |
+| `namePlural` | string | API-friendly plural name (e.g., `companies`) |
+| `labelSingular` | string | Display label singular (e.g., `Company`) |
+| `labelPlural` | string | Display label plural (e.g., `Companies`) |
+| `description` | string | Optional description |
+| `icon` | string | Icon identifier for the UI |
+| `isCustom` | boolean | `true` for user-created objects, `false` for standard |
+| `isActive` | boolean | Whether the object is active and queryable |
+| `isSystem` | boolean | Whether the object is a system-internal object |
+| `isRemote` | boolean | Whether data is stored in a remote source |
+| `isSearchable` | boolean | Whether the object supports search indexing |
+| `isLabelSyncedWithName` | boolean | Auto-sync label changes to API name |
+| `labelIdentifierFieldMetadataId` | UUID | Field used as the display label |
+| `imageIdentifierFieldMetadataId` | UUID | Field used as the display image |
+| `fields` | FieldMetadataEntity[] | One-to-many relationship to fields |
+| `workspaceId` | UUID | Owning workspace |
+
+### Field metadata entity
+
+The `FieldMetadataEntity` (defined in `field-metadata/field-metadata.entity.ts`) represents a single field on an object.
+
+**Key properties:**
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `id` | UUID | Primary identifier |
+| `objectMetadataId` | UUID | Parent object reference |
+| `type` | FieldMetadataType | Field type enum |
+| `name` | string | API-friendly field name |
+| `label` | string | Display label |
+| `description` | string | Optional description |
+| `icon` | string | Icon identifier |
+| `isCustom` | boolean | `true` for user-created fields |
+| `isActive` | boolean | Whether the field is active |
+| `isSystem` | boolean | Whether the field is system-internal |
+| `isNullable` | boolean | Whether the field accepts null |
+| `isUnique` | boolean | Whether values must be unique |
+| `defaultValue` | JSON | Type-specific default value |
+| `options` | JSON | Type-specific options (e.g., select choices) |
+| `settings` | JSON | Type-specific settings (e.g., number format) |
+| `relationTargetObjectMetadataId` | UUID | Target object for relation fields |
+| `relationTargetFieldMetadataId` | UUID | Target field for relation fields |
+| `morphId` | string | Identifier for morph (polymorphic) relations |
+
+### Supported field types
+
+The `FieldMetadataType` enum (defined in `twenty-shared/src/types/FieldMetadataType.ts`) specifies all supported field types:
+
+| Type | Category | Description |
+|------|----------|-------------|
+| `TEXT` | Primitive | Single-line or multi-line text |
+| `NUMBER` | Primitive | Numeric value (integer or float) |
+| `BOOLEAN` | Primitive | True/false value |
+| `DATE` | Primitive | Date without time |
+| `DATE_TIME` | Primitive | Date with time |
+| `UUID` | Primitive | Universally unique identifier |
+| `NUMERIC` | Primitive | Arbitrary-precision numeric |
+| `POSITION` | Primitive | Ordering position value |
+| `RATING` | Enum | Star rating with predefined options |
+| `SELECT` | Enum | Single-choice dropdown |
+| `MULTI_SELECT` | Enum | Multiple-choice selection |
+| `CURRENCY` | Composite | Amount (micros) + currency code |
+| `ADDRESS` | Composite | Street, city, state, country, postal code |
+| `FULL_NAME` | Composite | First name + last name |
+| `LINKS` | Composite | URL + label pairs |
+| `EMAILS` | Composite | Email address list |
+| `PHONES` | Composite | Phone number list |
+| `ACTOR` | Composite | User/source attribution |
+| `RICH_TEXT_V2` | Composite | Rich text content |
+| `RELATION` | Relational | Foreign key to another object |
+| `MORPH_RELATION` | Relational | Polymorphic relation to multiple object types |
+| `ARRAY` | Complex | JSON array |
+| `RAW_JSON` | Complex | Arbitrary JSON |
+| `FILES` | Complex | File attachment references |
+| `TS_VECTOR` | Internal | Full-text search vector |
+| `RICH_TEXT` | Deprecated | Legacy rich text (use RICH_TEXT_V2) |
+
+### Composite field types
+
+Composite fields are field types that expand into multiple database columns. For example, a `CURRENCY` field stores both `amountMicros` (bigint) and `currencyCode` (text). These are defined in `field-metadata/types/composite-field-metadata-type.type.ts`.
+
+The eight composite types are: `ADDRESS`, `CURRENCY`, `FULL_NAME`, `LINKS`, `EMAILS`, `PHONES`, `RICH_TEXT_V2`, and `ACTOR`.
+
+### Enum field types
+
+Enum fields (`SELECT`, `MULTI_SELECT`, `RATING`) use the options system, defined in `twenty-shared/src/types/FieldMetadataOptions.ts`:
+
+- **FieldMetadataDefaultOption**: Basic option with `id`, `position`, `label`, and `value` (used by `RATING`).
+- **FieldMetadataComplexOption**: Extends the default option with a `color` property from the `TagColor` palette (used by `SELECT` and `MULTI_SELECT`).
+
+### Field settings
+
+Type-specific configuration is stored in the `settings` JSON column. Key settings types (from `twenty-shared/src/types/FieldMetadataSettings.ts`):
+
+| Field Type | Settings | Description |
+|------------|----------|-------------|
+| `NUMBER` | `dataType`, `decimals`, `type` | Number format (int/float/bigint), decimal places, display variant (number/percentage) |
+| `DATE` / `DATE_TIME` | `displayFormat` | How dates are rendered (RELATIVE, USER_SETTINGS, CUSTOM) |
+| `RELATION` | `relationType`, `onDelete`, `joinColumnName` | Relation configuration |
+| `ADDRESS` | `subFields` | Which address sub-fields are enabled |
+| `FILES` | `maxNumberOfValues` | Maximum file attachments |
+| `EMAILS` / `PHONES` / `LINKS` | `maxNumberOfValues`, `clickAction` | Multi-item settings with click behavior (COPY/OPEN_LINK) |
+
+### Default values
+
+Field default values are type-specific and support two special function values:
+- `uuid` — generates a UUID (for `UUID` fields)
+- `now` — generates the current timestamp (for `DATE` and `DATE_TIME` fields)
+
+Static defaults are supported for all primitive types, and composite types accept structured defaults (e.g., `{ amountMicros: null, currencyCode: "USD" }` for `CURRENCY`).
+
+---
+
+## Detailed function requirements
+
+### FR-1: Create custom object
+
+**Resolver**: `ObjectMetadataResolver.createOneObject()`
+**Service**: `ObjectMetadataService.createOneObject()`
+**Permission**: Requires `SettingsPermissionGuard(DATA_MODEL)`.
+
+**Input** (`CreateObjectInput`):
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `nameSingular` | Yes | API name (validated by `@IsValidMetadataName`) |
+| `namePlural` | Yes | Plural API name |
+| `labelSingular` | Yes | Display label |
+| `labelPlural` | Yes | Plural display label |
+| `description` | No | Object description |
+| `icon` | No | Icon identifier |
+| `isLabelSyncedWithName` | No | Auto-sync label to name |
+| `skipNameField` | No | Skip generating a default `name` field |
+| `isRemote` | No | Whether the object uses a remote data source |
+
+**Behavior**:
+1. Validates input fields and checks for name conflicts in the workspace.
+2. Generates default system fields (e.g., `id`, `createdAt`, `updatedAt`, `createdBy`, `updatedBy`, `deletedAt`, `position`) via `buildDefaultFlatFieldMetadatasForCustomObject()`.
+3. Generates default relation fields (e.g., activity targets, task targets, note targets, attachments, favorites, timeline activities) via `buildDefaultRelationFlatFieldMetadatasForCustomObject()`.
+4. Creates default indexes via `buildDefaultIndexForCustomObject()`.
+5. Delegates to `WorkspaceMigrationValidateBuildAndRunService` to validate, build, and execute the migration.
+6. Invalidates caches and returns the created `FlatObjectMetadata`.
+
+### FR-2: Update custom object
+
+**Resolver**: `ObjectMetadataResolver.updateOneObject()`
+**Service**: `ObjectMetadataService.updateOneObject()`
+
+**Behavior**:
+1. Accepts partial updates to object properties (label, description, icon, isActive, etc.).
+2. When deactivating an object (`isActive: false`), the associated database table is kept but excluded from the generated GraphQL schema.
+3. Triggers workspace migration for structural changes.
+4. Invalidates schema and view caches.
+
+### FR-3: Delete custom object
+
+**Resolver**: `ObjectMetadataResolver.deleteOneObject()`
+**Service**: `ObjectMetadataService.deleteOneObject()`
+
+**Behavior**:
+1. Validates the object is custom (`isCustom: true`) — standard objects cannot be deleted.
+2. Removes all associated fields, relations, views, and indexes.
+3. Executes a delete migration to drop the database table.
+4. Cleans up related metadata (favorites, navigation menu items, etc.).
+5. Invalidates all related caches.
+
+### FR-4: Create custom field
+
+**Resolver**: `FieldMetadataResolver.createOneField()`
+**Service**: `FieldMetadataService.createOneField()`
+**Permission**: Requires `SettingsPermissionGuard(DATA_MODEL)`.
+
+**Input** (`CreateFieldInput`):
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `objectMetadataId` | Yes | Parent object UUID |
+| `type` | Yes | `FieldMetadataType` enum value |
+| `name` | Yes | API-friendly field name |
+| `label` | Yes | Display label |
+| `description` | No | Field description |
+| `icon` | No | Icon identifier |
+| `isNullable` | No | Allow null values (default: true) |
+| `isUnique` | No | Enforce uniqueness (default: false) |
+| `defaultValue` | No | Type-specific default |
+| `options` | No | Options for SELECT/MULTI_SELECT/RATING fields |
+| `settings` | No | Type-specific settings |
+| `morphRelationsCreationPayload` | No | Relation creation payloads for MORPH_RELATION fields |
+
+**Behavior**:
+1. Validates the field type and associated options/settings.
+2. For enum fields (`SELECT`, `MULTI_SELECT`), validates option uniqueness, label, value, and color using `validateOptionsForType()`.
+3. Serializes default values (handling function defaults like `uuid` and `now`).
+4. For relation fields, creates the corresponding foreign key field on the target object.
+5. Delegates to `WorkspaceMigrationValidateBuildAndRunService` for schema migration.
+6. Automatically adds the new field to existing views.
+7. Invalidates caches and returns the created `FlatFieldMetadata`.
+
+### FR-5: Update custom field
+
+**Resolver**: `FieldMetadataResolver.updateOneField()`
+**Service**: `FieldMetadataService.updateOneField()`
+
+**Behavior**:
+1. Accepts partial updates (label, description, icon, options, settings, defaultValue, isActive).
+2. Validates updated options/settings against the field type constraints.
+3. For enum fields, allows adding, removing, or reordering options.
+4. Triggers migration for structural changes (e.g., nullable, unique constraints).
+5. Invalidates caches.
+
+### FR-6: Delete custom field
+
+**Resolver**: `FieldMetadataResolver.deleteOneField()`
+**Service**: `FieldMetadataService.deleteOneField()`
+
+**Behavior**:
+1. Validates the field is custom (`isCustom: true`) — standard fields cannot be deleted.
+2. For relation fields, also removes the corresponding foreign key field on the related object.
+3. Executes a migration to drop the database column(s).
+4. Removes the field from all views and filters.
+5. Invalidates caches.
+
+### FR-7: Workspace migration system
+
+**Service**: `WorkspaceMigrationValidateBuildAndRunService`
+
+The migration system converts metadata changes into actual database schema changes. It operates in three phases:
+
+1. **Validate** — Checks the proposed changes against current flat entity maps to detect conflicts (duplicate names, invalid types, broken references).
+2. **Build** — Translates validated metadata mutations into migration actions using specialized builders:
+   - `WorkspaceMigrationObjectActionsBuilderService` for object create/update/delete
+   - `WorkspaceMigrationFieldActionsBuilderService` for field create/update/delete
+   - `WorkspaceMigrationViewActionsBuilderService` for views
+   - Additional builders for roles, webhooks, page layouts, and more
+3. **Run** — Executes migration actions via `WorkspaceMigrationRunnerService`, which uses a handler registry (`WorkspaceMigrationRunnerActionHandlerRegistry`) mapping `${actionType}_${metadataName}` keys to specialized handlers.
+
+**Migration action types**: `create`, `update`, `delete`.
+
+### FR-8: Schema generation and caching
+
+The workspace schema manager (`WorkspaceSchemaManagerService`) maintains a facade over five sub-managers:
+- `WorkspaceSchemaTableManagerService` — Table create/alter/drop
+- `WorkspaceSchemaColumnManagerService` — Column create/alter/drop
+- `WorkspaceSchemaIndexManagerService` — Index management
+- `WorkspaceSchemaEnumManagerService` — Enum type management
+- `WorkspaceSchemaForeignKeyManagerService` — Foreign key constraints
+
+**Caching strategy** (implemented in `WorkspaceCacheService`):
+- **Two-tier cache**: Local in-memory Map (30-minute TTL, max 1000 entries) backed by a persistent cache storage service.
+- **PromiseMemoizer**: Deduplicates concurrent cache build requests (10-second TTL).
+- **Stale version management**: Keeps up to 5 stale versions (5-second TTL) to handle in-flight requests during cache invalidation.
+- Cache is invalidated automatically when metadata changes are applied.
+
+### FR-9: Standard object definitions
+
+Standard objects (e.g., `Company`, `Person`, `Task`, `Note`) are defined as workspace entities extending `BaseWorkspaceEntity` in `packages/twenty-server/src/modules/`. They use composite field metadata types:
+
+```
+CompanyWorkspaceEntity
+├── domainName: LinksMetadata
+├── annualRecurringRevenue: CurrencyMetadata
+├── address: AddressMetadata
+├── createdBy: ActorMetadata
+├── people: EntityRelation<PersonWorkspaceEntity[]>
+└── accountOwner: EntityRelation<WorkspaceMemberWorkspaceEntity>
+```
+
+Standard objects have `isCustom: false` and `isSystem: false`. Their fields and relations are synchronized via the workspace sync metadata mechanism, which compares the code-defined entity structure with the stored metadata and generates migration actions for any differences.
+
+### FR-10: Frontend integration
+
+The frontend manages custom objects and fields through React hooks and GraphQL mutations:
+
+**Hooks** (in `packages/twenty-front/src/modules/object-metadata/hooks/`):
+
+| Hook | Purpose |
+|------|---------|
+| `useCreateOneObjectMetadataItem()` | Create a custom object |
+| `useUpdateOneObjectMetadataItem()` | Update object metadata |
+| `useDeleteOneObjectMetadataItem()` | Delete a custom object |
+| `useCreateOneFieldMetadataItem()` | Create a custom field |
+| `useUpdateOneFieldMetadataItem()` | Update field metadata |
+| `useDeleteOneFieldMetadataItem()` | Delete a custom field |
+| `useObjectMetadataItems()` | Fetch all objects in the workspace |
+| `useFieldMetadataItem()` | Fetch a single field |
+
+**Settings UI pages** (in `packages/twenty-front/src/pages/settings/data-model/`):
+
+| Page | Purpose |
+|------|---------|
+| `SettingsObjects` | Lists all standard and custom objects |
+| `SettingsNewObject` | Form to create a new custom object |
+| `SettingsObjectDetailPage` | Object detail view with tabs: Overview, Fields, Indexes, Settings |
+| `SettingsObjectFieldEdit` | Edit a field's label, type, options, and settings |
 
 
