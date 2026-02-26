@@ -360,17 +360,15 @@ The workspace schema manager (`WorkspaceSchemaManagerService`) maintains a facad
 
 ### FR-9: Standard object definitions
 
-Standard objects (e.g., `Company`, `Person`, `Task`, `Note`) are defined as workspace entities extending `BaseWorkspaceEntity` in `packages/twenty-server/src/modules/`. They use composite field metadata types:
+Standard objects (e.g., `Company`, `Person`, `Task`, `Note`) are defined as workspace entities extending `BaseWorkspaceEntity` in `packages/twenty-server/src/modules/`. They use composite field metadata types.
 
-```
-CompanyWorkspaceEntity
-├── domainName: LinksMetadata
-├── annualRecurringRevenue: CurrencyMetadata
-├── address: AddressMetadata
-├── createdBy: ActorMetadata
-├── people: EntityRelation<PersonWorkspaceEntity[]>
-└── accountOwner: EntityRelation<WorkspaceMemberWorkspaceEntity>
-```
+For example, `CompanyWorkspaceEntity` includes:
+- `domainName` — `LinksMetadata`
+- `annualRecurringRevenue` — `CurrencyMetadata`
+- `address` — `AddressMetadata`
+- `createdBy` — `ActorMetadata`
+- `people` — `EntityRelation<PersonWorkspaceEntity[]>`
+- `accountOwner` — `EntityRelation<WorkspaceMemberWorkspaceEntity>`
 
 Standard objects have `isCustom: false` and `isSystem: false`. Their fields and relations are synchronized via the workspace sync metadata mechanism, which compares the code-defined entity structure with the stored metadata and generates migration actions for any differences.
 
